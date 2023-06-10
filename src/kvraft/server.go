@@ -18,11 +18,28 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type OpType int8
+
+const (
+	GET    OpType = 0
+	PUT    OpType = 1
+	APPEND OpType = 2
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClerkId   int64
+	CommandId int64
+	Type      OpType
+	Key       string
+	Value     string
+}
+
+type CommandMsg struct {
+	execute bool
+	value   string
 }
 
 type KVServer struct {
@@ -35,15 +52,122 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	persister            *raft.Persister
+	db                   *DB
+	clerkCommandRecord   map[int64]int64
+	clerkCommandInformer map[int64]map[int64]chan CommandMsg
+	lastAppliedIndex     int
 }
-
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	if args.CommandId <= kv.clerkCommandRecord[args.ClerkId] {
+		//fmt.Println("command", args.CommandId, "has been executed before command", kv.clerkCommandRecord[args.ClerkId])
+		reply.Value = kv.db.Get(args.Key)
+		kv.mu.Unlock()
+		return
+	}
+	_, _, ok := kv.rf.Start(Op{ClerkId: args.ClerkId, CommandId: args.CommandId, Type: GET, Key: args.Key})
+	if !ok {
+		kv.mu.Unlock()
+		reply.Err = "this server is not a leader"
+		return
+	}
+	if kv.clerkCommandInformer[args.ClerkId] == nil {
+		kv.clerkCommandInformer[args.ClerkId] = map[int64]chan CommandMsg{}
+	}
+	ch := make(chan CommandMsg)
+	kv.clerkCommandInformer[args.ClerkId][args.CommandId] = ch
+	kv.mu.Unlock()
+	commandMsg := <-ch
+	if !commandMsg.execute {
+		reply.Err = "this command has been executed"
+		return
+	}
+	reply.Err = ""
+	reply.Value = commandMsg.value
+	return
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	if args.CommandId <= kv.clerkCommandRecord[args.ClerkId] {
+		//fmt.Println("command", args.CommandId, args.Op, args.Key, ":", args.Value, "has been executed before command", kv.clerkCommandRecord[args.ClerkId])
+		kv.mu.Unlock()
+		return
+	}
+	opType := PUT
+	if args.Op == "Append" {
+		opType = APPEND
+	}
+	_, _, ok := kv.rf.Start(Op{ClerkId: args.ClerkId, CommandId: args.CommandId, Type: opType, Key: args.Key, Value: args.Value})
+	if !ok {
+		kv.mu.Unlock()
+		reply.Err = "this server is not a leader"
+		return
+	}
+	if kv.clerkCommandInformer[args.ClerkId] == nil {
+		kv.clerkCommandInformer[args.ClerkId] = map[int64]chan CommandMsg{}
+	}
+	ch := make(chan CommandMsg)
+	kv.clerkCommandInformer[args.ClerkId][args.CommandId] = ch
+	kv.mu.Unlock()
+	commandMsg := <-ch
+	if !commandMsg.execute {
+		reply.Err = "this command has been executed"
+		return
+	}
+	reply.Err = ""
+	return
+}
+
+func (kv *KVServer) listenApplyCh() {
+	for !kv.killed() {
+		applyMsg := <-kv.applyCh
+		kv.mu.Lock()
+		if applyMsg.CommandValid {
+			kv.lastAppliedIndex = applyMsg.CommandIndex
+			op := applyMsg.Command.(Op)
+			if op.CommandId <= kv.clerkCommandRecord[op.ClerkId] {
+				if kv.clerkCommandInformer[op.ClerkId] != nil && kv.clerkCommandInformer[op.ClerkId][op.CommandId] != nil {
+					//if kv.rf.Role == raft.Leader {
+					//	kv.clerkCommandInformer[op.ClerkId][op.CommandId] <- CommandMsg{execute: false}
+					//}
+					kv.clerkCommandInformer[op.ClerkId][op.CommandId] <- CommandMsg{execute: false}
+					kv.clerkCommandInformer[op.ClerkId][op.CommandId] = nil
+					delete(kv.clerkCommandInformer[op.ClerkId], op.CommandId)
+				}
+				kv.mu.Unlock()
+				continue
+			}
+			var value string
+			switch op.Type {
+			case GET:
+				value = kv.db.Get(op.Key)
+			case PUT:
+				kv.db.Put(op.Key, op.Value)
+			case APPEND:
+				kv.db.Append(op.Key, op.Value)
+				//fmt.Printf("[%v] succeed to execute log %v append key %v value: %v. Current value: %v\n", kv.me, applyMsg.CommandIndex, op.Key, op.Value, kv.db.Get(op.Key))
+			}
+			if kv.clerkCommandInformer[op.ClerkId] != nil && kv.clerkCommandInformer[op.ClerkId][op.CommandId] != nil {
+				//if kv.rf.Role == raft.Leader {
+				//	kv.clerkCommandInformer[op.ClerkId][op.CommandId] <- CommandMsg{execute: true, value: value}
+				//}
+				kv.clerkCommandInformer[op.ClerkId][op.CommandId] <- CommandMsg{execute: true, value: value}
+				kv.clerkCommandInformer[op.ClerkId][op.CommandId] = nil
+				delete(kv.clerkCommandInformer[op.ClerkId], op.CommandId)
+			}
+			kv.clerkCommandRecord[op.ClerkId] = op.CommandId
+			kv.checkRaftStateSize()
+		} else {
+			//fmt.Printf("[%v] install snapshot with lastAppliedIndex %v\n", kv.me, applyMsg.SnapshotIndex)
+			kv.LoadSnapshot(applyMsg.Snapshot)
+		}
+		kv.mu.Unlock()
+	}
 }
 
 //
@@ -96,6 +220,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.persister = persister
+	kv.db = NewDB()
+	kv.clerkCommandRecord = map[int64]int64{}
+	kv.clerkCommandInformer = map[int64]map[int64]chan CommandMsg{}
 
+	kv.LoadSnapshot(persister.ReadSnapshot())
+
+	go kv.listenApplyCh()
+
+	//fmt.Printf("[%v] start with lastIncludedIndex: %v, logsNum: %v, data: %v, logs: %v\n", me, kv.rf.LastIncludedIndex, len(kv.rf.Logs), kv.db.data, kv.rf.Logs)
 	return kv
 }

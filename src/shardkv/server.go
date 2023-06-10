@@ -1,17 +1,35 @@
 package shardkv
 
-
-import "6.824/labrpc"
+import (
+	"6.824/labrpc"
+	"6.824/shardctrler"
+)
 import "6.824/raft"
 import "sync"
 import "6.824/labgob"
 
+type OpType int8
 
+const (
+	GET    OpType = 0
+	PUT    OpType = 1
+	APPEND OpType = 2
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ClerkId   int64
+	CommandId int64
+	Type      OpType
+	Key       string
+	Value     string
+}
+
+type CommandMsg struct {
+	execute bool
+	value   string
 }
 
 type ShardKV struct {
@@ -25,8 +43,15 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	clerkId              int64
+	commandId            int64
+	persister            *raft.Persister
+	db                   *DB
+	ownShard             []bool
+	clerkCommandRecord   map[int64]int64
+	clerkCommandInformer map[int64]map[int64]chan CommandMsg
+	lastAppliedIndex     int
 }
-
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
@@ -46,7 +71,6 @@ func (kv *ShardKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
 }
-
 
 //
 // servers[] contains the ports of the servers in this group.
@@ -96,6 +120,13 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
+	kv.clerkId = nrand()
+	kv.commandId = 1
+	kv.persister = persister
+	kv.db = NewDB()
+	kv.ownShard = make([]bool, shardctrler.NShards)
+	kv.clerkCommandRecord = map[int64]int64{}
+	kv.clerkCommandInformer = map[int64]map[int64]chan CommandMsg{}
 
 	return kv
 }

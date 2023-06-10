@@ -28,6 +28,21 @@ type Config struct {
 	Groups map[int][]string // gid -> servers[]
 }
 
+func (config Config) Copy() Config {
+	ret := Config{}
+	ret.Num = config.Num
+	for i := range config.Shards {
+		ret.Shards[i] = config.Shards[i]
+	}
+	ret.Groups = map[int][]string{}
+	for gid, servers := range config.Groups {
+		temp := make([]string, len(servers))
+		copy(temp, servers)
+		ret.Groups[gid] = temp
+	}
+	return ret
+}
+
 const (
 	OK = "OK"
 )
@@ -35,7 +50,9 @@ const (
 type Err string
 
 type JoinArgs struct {
-	Servers map[int][]string // new GID -> servers mappings
+	Servers   map[int][]string // new GID -> servers mappings
+	ClerkId   int64
+	CommandId int64
 }
 
 type JoinReply struct {
@@ -44,7 +61,9 @@ type JoinReply struct {
 }
 
 type LeaveArgs struct {
-	GIDs []int
+	GIDs      []int
+	ClerkId   int64
+	CommandId int64
 }
 
 type LeaveReply struct {
@@ -53,8 +72,10 @@ type LeaveReply struct {
 }
 
 type MoveArgs struct {
-	Shard int
-	GID   int
+	Shard     int
+	GID       int
+	ClerkId   int64
+	CommandId int64
 }
 
 type MoveReply struct {
@@ -63,7 +84,9 @@ type MoveReply struct {
 }
 
 type QueryArgs struct {
-	Num int // desired config number
+	Num       int // desired config number
+	ClerkId   int64
+	CommandId int64
 }
 
 type QueryReply struct {
